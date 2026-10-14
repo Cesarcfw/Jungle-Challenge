@@ -1,0 +1,17 @@
+node_modules
+.tools
+.git
+.github
+.env
+.env.*
+!.env.example
+coverage
+dist
+artifacts
+.estudo
+CHALLENGE.md
+LABORATORIO.md
+DEVELOPMENT.md
+DELIVERY.md
+PRESENTATION.md
+*.log

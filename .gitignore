@@ -1,0 +1,16 @@
+node_modules/
+.tools/
+.env
+.env.*
+!.env.example
+coverage/
+dist/
+*.log
+artifacts/
+.estudo/
+/scripts/lab*
+/CHALLENGE.md
+/LABORATORIO.md
+/DEVELOPMENT.md
+/DELIVERY.md
+/PRESENTATION.md

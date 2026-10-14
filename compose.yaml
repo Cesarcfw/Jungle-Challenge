@@ -1,0 +1,97 @@
+name: jungle-wagering
+
+x-application: &application
+  image: jungle-wagering-processor:local
+  init: true
+  environment: &application-environment
+    DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle
+    SQS_ENDPOINT: http://localstack:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    CURSOR_SECRET: ${CURSOR_SECRET:-local-development-cursor-key-change-before-production}
+    API_BASE_URLS: http://api:3000,http://api2:3000,http://api3:3000
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    localstack:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    interval: 2s
+    timeout: 8s
+    retries: 30
+  stop_grace_period: 30s
+
+services:
+  migrate:
+    image: jungle-wagering-processor:local
+    build: .
+    command: ["bun", "src/infrastructure/database/manage.ts", "up"]
+    environment:
+      DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    <<: *application
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+  api2:
+    <<: *application
+    ports:
+      - "127.0.0.1:${API2_PORT:-3001}:3000"
+  api3:
+    <<: *application
+    ports:
+      - "127.0.0.1:${API3_PORT:-3002}:3000"
+  tests:
+    image: jungle-wagering-processor:local
+    profiles: ["test"]
+    command: ["bun", "run", "verify"]
+    init: true
+    environment:
+      DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle_test
+      TEST_DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle_test
+      SCHEMA_TEST_DATABASE_URL: postgresql://jungle:jungle@postgres:5432/jungle_schema_test
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+  localstack:
+    image: localstack/localstack:4.12.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "127.0.0.1:${SQS_PORT:-4566}:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: jungle
+      POSTGRES_PASSWORD: jungle
+      POSTGRES_DB: jungle
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-test.sql:/docker-entrypoint-initdb.d/01-test.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jungle -d jungle"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres-data:
