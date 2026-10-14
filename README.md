@@ -83,4 +83,4 @@ Referências ausentes são reprocessadas com backoff e TTL de 24 horas. Reconcil
 
 Autenticação externa não foi implementada; há um guard de extensão e desenho OIDC documentados. Não houve teste de carga nem implementação de dashboard, tracing ou partidas dobradas. A validação por triggers percorre o histórico da wallet e precisa de avaliação para volumes maiores. LocalStack usa filas efêmeras: reiniciá-lo pode perder mensagens do broker; eventos ainda pendentes na outbox permanecem no PostgreSQL.
 
-Decisões técnicas e limitações: [ARCHITECTURE.md](ARCHITECTURE.md).
+Diagramas, decisões técnicas e limitações: [ARCHITECTURE.md](ARCHITECTURE.md).

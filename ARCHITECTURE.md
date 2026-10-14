@@ -1,5 +1,35 @@
 # Decisões de arquitetura
 
+## Componentes
+
+Cada uma das três instâncias executa HTTP e os mesmos workers. O banco coordena concorrência e idempotência entre os processos; as filas são compartilhadas.
+
+```mermaid
+flowchart LR
+    Provider["Provedor"] -->|HTTP| HTTP
+    Provider -->|Mensagem| Requests["SQS: wager-transactions.fifo"]
+
+    subgraph Instance["Cada instância: api, api2 e api3"]
+        HTTP["Controllers NestJS"] --> Service["WageringService"]
+        Consumer["WagerConsumer"] --> Service
+        References["Worker de referências"] --> Service
+        Service --> Domain["Money, Wallet e WagerTransaction"]
+        Service --> Store["PostgresFinancialStore / MikroORM"]
+        Publisher["OutboxPublisher"]
+    end
+
+    Requests -->|ReceiveMessage| Consumer
+    Store --> DB[("PostgreSQL")]
+    References -->|Busca pendências| DB
+    Publisher -->|Busca e marca outbox| DB
+    Publisher -->|SendMessage| Events["SQS: wager-events.fifo"]
+    Consumer -->|Mensagem inválida ou falha final| DLQ["SQS: wager-transactions-dlq.fifo"]
+    Requests -.->|Redrive após limite de recebimentos| DLQ
+    Migration["Serviço migrate"] -->|Antes das APIs| DB
+```
+
+As três filas são emuladas pelo LocalStack. A fila de eventos é a saída para aplicações externas; este serviço não mantém um consumidor contínuo desses eventos.
+
 ## Organização e dinheiro
 
 O domínio contém Money, Wallet, WagerTransaction, ledger e eventos, sem decorators de NestJS ou tipos monetários do ORM. A aplicação coordena as regras por FinancialStore; a infraestrutura implementa persistência e SQS. Factories criam e reidratam entidades, mantendo transições explícitas e estado encapsulado.
@@ -22,6 +52,43 @@ O custo dessa proteção é percorrer o histórico da wallet para conferir saldo
 
 As migrations são versionadas com up/down e executadas antes das APIs. A reversão de operações estendidas recusa downgrade com registros incompatíveis, em vez de descartar esses registros silenciosamente.
 
+### Processamento de uma aposta
+
+Caminho de uma BET nova e aprovada. A consulta de idempotência é repetida depois do lock porque outra instância pode ter confirmado o pedido durante a espera. Replays retornam o resultado salvo; rejeições e LOSS não fazem as escritas de saldo/ledger mostradas neste caminho.
+
+```mermaid
+sequenceDiagram
+    actor Client as Provedor
+    participant HTTP as Controller HTTP
+    participant Service as WageringService
+    participant Store as FinancialStore / FinancialSession
+    participant DB as PostgreSQL
+
+    Client->>HTTP: POST transação + Idempotency-Key
+    HTTP->>HTTP: Validar contrato
+    HTTP->>Service: bet(input, key, correlationId)
+    Service->>Service: Criar Money e calcular payloadHash
+    Service->>Store: transaction(callback)
+    Store->>DB: BEGIN
+    Service->>Store: Consultar chave e identidade externa
+    Store->>DB: SELECT transações existentes
+    DB-->>Store: Nenhuma operação existente
+    Service->>Store: lockWallet(walletId)
+    Store->>DB: SELECT wallet FOR UPDATE
+    DB-->>Store: Wallet bloqueada, saldo 100.00
+    Service->>Store: Reconsultar idempotência
+    Store->>DB: SELECT transações existentes
+    DB-->>Store: Operação continua nova
+    Service->>Service: Validar regras e aplicar Wallet.debit(80.00)
+    Service->>Store: Salvar transação, wallet, ledger e outbox
+    Store->>DB: INSERTs e UPDATE no mesmo contexto SQL
+    Store->>DB: COMMIT
+    Note over Store,DB: Constraints diferidas conferem consistência.<br/>O lock só é liberado ao concluir a transação.
+    Store-->>Service: Resultado confirmado
+    Service-->>HTTP: PROCESSED, saldo observado 20.00
+    HTTP-->>Client: HTTP 200
+```
+
 ## Idempotência, estados e reversões
 
 Idempotency-Key é obrigatória e globalmente única. A identidade externa é única por provider. Mesmo corpo e chave retornam o resultado salvo com idempotentReplay=true; chave divergente para a mesma identidade externa ou mesma chave com outro corpo geram conflito.
@@ -38,6 +105,29 @@ Referência ausente ou pendente gera PENDING_REFERENCE sem mover saldo. Worker r
 
 Códigos de contrato: INVALID_PAYLOAD, INVALID_AMOUNT, INVALID_CURRENCY, AMOUNT_OUT_OF_RANGE, INVALID_MOVEMENT_AMOUNT, INVALID_KIND, INVALID_PROVIDER, REFERENCE_REQUIRED, REFERENCE_NOT_ALLOWED e SELF_REFERENCE. Conflitos: IDEMPOTENCY_CONFLICT e WALLET_ALREADY_EXISTS. Rejeições financeiras: INSUFFICIENT_FUNDS, CURRENCY_MISMATCH, PLAYER_MISMATCH, REFERENCE_NOT_PROCESSED, REFERENCE_IDENTITY_MISMATCH, INVALID_REFERENCE_KIND, REFERENCE_AMOUNT_MISMATCH, REFERENCE_ALREADY_REVERSED e REFERENCE_EXPIRED. Reversão sem saldo usa REVERSAL_INSUFFICIENT_FUNDS, distinto de aposta sem saldo. Falha transitória HTTP retorna 503/INFRASTRUCTURE_UNAVAILABLE; falha interna/permanente retorna 500/INTERNAL_PROCESSING_ERROR. Replay de FAILED retorna 500 com seu resultado auditável.
 
+### Estados da transação
+
+Transições permitidas pela entidade. FAILED representa uma conclusão de infraestrutura registrada, enquanto REJECTED representa recusa de negócio. Estados terminais não têm transição de saída para outro estado de negócio.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING
+    PENDING --> PROCESSED: Aplicar
+    PENDING --> REJECTED: Recusar
+    PENDING --> FAILED: Falha final
+    PENDING --> PENDING_REFERENCE: Aguardar referência
+    PENDING_REFERENCE --> PENDING_REFERENCE: Backoff
+    PENDING_REFERENCE --> PROCESSED: Resolver
+    PENDING_REFERENCE --> REJECTED: Recusar ou expirar
+    PENDING_REFERENCE --> FAILED: fail no domínio
+    PROCESSED --> [*]
+    REJECTED --> [*]
+    FAILED --> [*]
+```
+
+O worker de referências conclui pendências como PROCESSED ou REJECTED. O caminho de falha final do consumidor não converte uma operação já existente em FAILED; ele preserva a operação encontrada e sua idempotência.
+
 ## Mensagens e eventos
 
 HTTP e SQS usam WageringService. A inbox tem chave consumer_name/message_id do envelope da aplicação. Seu hash inclui comando e idempotencyKey, excluindo metadados de transporte. Inserção e lock da inbox detectam conteúdo divergente; processed_at é confirmado junto do efeito financeiro. A idempotência financeira continua protegendo a operação mesmo quando chegam mensagens diferentes.
@@ -53,6 +143,132 @@ Outbox é gravada no mesmo commit financeiro. Publishers buscam linhas com FOR U
 Morte após envio e antes da marcação pode repetir o evento. MessageGroupId usa walletId e deduplicação FIFO usa eventId; o destinatário ainda precisa de inbox persistente por eventId. FIFO é uma otimização, não a garantia final. Eventos também podem chegar fora de ordem; BalanceChanged inclui walletVersion.
 
 No shutdown, workers param novos agendamentos, polls são abortados e trabalho em andamento é aguardado antes de fechar ORM/SQS. Promise.allSettled mantém todos os handlers do lote nessa espera mesmo quando um falha. Compose usa init e prazo de 30s para encerramento.
+
+### Inbox, commit, ack e publicação
+
+O commit financeiro e o envio ao broker são etapas separadas. A inbox participa da primeira; o publisher recupera a outbox já confirmada na segunda.
+
+```mermaid
+sequenceDiagram
+    participant SQS as SQS / LocalStack
+    participant Consumer as WagerConsumer
+    participant Service as WageringService
+    participant DB as PostgreSQL
+    participant Publisher as OutboxPublisher
+
+    Consumer->>SQS: ReceiveMessage na fila de pedidos
+    SQS-->>Consumer: Envelope com messageId e comando
+    Consumer->>Service: bet com contexto de inbox
+    Service->>DB: BEGIN, registrar e bloquear inbox
+    Service->>DB: Consultar idempotência e bloquear wallet
+    Service->>DB: Gravar transação, movimento e eventos
+    Service->>DB: Marcar inbox processada e COMMIT
+    DB-->>Service: Confirmação
+    Service-->>Consumer: Resultado financeiro
+    alt Consumidor conclui o ack
+        Consumer->>SQS: DeleteMessage
+    else Morte depois do commit e antes do ack
+        Note over SQS,Consumer: Visibilidade expira.<br/>Outra instância recebe a mensagem.
+        SQS-->>Consumer: Redelivery do mesmo messageId
+        Consumer->>Service: Repetir comando com inbox
+        Service->>DB: Verificar inbox e buscar resultado persistido
+        Note over Service,DB: Sem novo débito, crédito, ledger ou evento financeiro.
+        DB-->>Service: Resultado original
+        Service-->>Consumer: Replay
+        Consumer->>SQS: DeleteMessage
+    end
+
+    Publisher->>DB: BEGIN e SELECT outbox FOR UPDATE SKIP LOCKED
+    DB-->>Publisher: Evento confirmado e ainda não publicado
+    Publisher->>SQS: SendMessage na fila de eventos
+    SQS-->>Publisher: Confirmação do envio
+    Note over DB,Publisher: Morte neste ponto deixa a outbox pendente.<br/>Novo envio preserva o mesmo eventId.
+    Publisher->>DB: Marcar published_at e COMMIT
+```
+
+O diagrama mostra a ordem necessária dentro de cada fluxo. O publisher pode publicar o evento antes ou depois do ack de entrada, desde que o commit financeiro já tenha ocorrido. As chamadas SQL do serviço passam pela implementação de FinancialStore.
+
+## Modelo de dados
+
+Relações físicas principais e campos usados nas garantias financeiras. Os tipos monetários abaixo correspondem a NUMERIC(20,2).
+
+```mermaid
+erDiagram
+    wallets ||--o{ wager_transactions : wallet_id
+    wallets ||--o{ wallet_ledger : wallet_id_currency
+    wager_transactions ||--o| wallet_ledger : transaction_id_wallet_id_currency
+    wager_transactions |o--o{ wager_transactions : reference_transaction_id
+
+    wallets {
+        uuid id PK
+        uuid player_id
+        varchar currency
+        numeric balance
+        integer version
+    }
+    wager_transactions {
+        uuid id PK
+        uuid wallet_id FK
+        uuid reference_transaction_id FK
+        text provider_id
+        text external_transaction_id
+        text idempotency_key UK
+        char payload_hash
+        text kind
+        numeric amount
+        varchar currency
+        text status
+        text failure_code
+        jsonb result
+        integer reference_attempts
+        timestamptz next_reference_attempt_at
+    }
+    wallet_ledger {
+        uuid id PK
+        uuid wallet_id FK
+        uuid transaction_id FK
+        varchar currency FK
+        text direction
+        numeric amount
+        numeric balance_before
+        numeric balance_after
+        integer wallet_version
+    }
+```
+
+As tabelas de mensageria e auditoria são independentes das FKs financeiras:
+
+```mermaid
+erDiagram
+    inbox_messages {
+        text consumer_name PK
+        text message_id PK
+        char payload_hash
+        timestamptz received_at
+        timestamptz processed_at
+    }
+    outbox_messages {
+        uuid id PK
+        uuid aggregate_id
+        text event_type
+        jsonb payload
+        integer attempts
+        timestamptz next_attempt_at
+        timestamptz published_at
+    }
+    message_failures {
+        text consumer_name PK
+        text message_id PK
+        char payload_hash PK
+        text failure_code
+        text disposition
+        timestamptz occurred_at
+    }
+```
+
+Inbox e auditoria identificam a mensagem sem FK para uma transação financeira. A outbox usa aggregate_id para identificar a wallet e transactionId no JSON do evento, sem FK nessas associações. Por isso essas tabelas aparecem sem linhas de relacionamento físico.
+
+Além das chaves mostradas, há uniques compostas em player/moeda, provider/ID externo, transação/wallet e wallet/versão do ledger. O índice parcial de reversões é único por reference_transaction_id/kind somente para operações processadas. Uma transação tem no máximo um lançamento; LOSS, rejeições, pendências e falhas não têm lançamento.
 
 ## Consultas e observabilidade
 
